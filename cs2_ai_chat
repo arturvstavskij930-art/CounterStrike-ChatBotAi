@@ -1,0 +1,324 @@
+"""
+CS2 AI Chat Assistant
+---------------------
+F8  -> открыть чат, прочитать последние сообщения (OCR), спросить LLM,
+       вставить ответ в поле чата (Enter жмёшь сам, если AUTO_SEND = False)
+F9  -> выйти
+
+Запуск:
+    python cs2_ai_chat.py              # обычный режим
+    python cs2_ai_chat.py --calibrate  # проверить область чата и OCR
+"""
+
+import argparse
+import os
+import re
+import sys
+import threading
+import time
+
+import keyboard
+import mss
+import pyautogui
+import pyperclip
+import pytesseract
+import requests
+from difflib import SequenceMatcher
+
+from PIL import Image, ImageOps
+
+# ======================= НАСТРОЙКИ =======================
+HOTKEY = "f8"                 # ответить на чат
+EXIT_HOTKEY = "f9"            # выход
+CHAT_KEY = "y"                # y = общий чат, u = командный (как в настройках игры)
+AUTO_SEND = False             # False = только вставить текст, Enter жмёшь ты
+
+LLM_BACKEND = "ollama"        # "ollama" (локально) или "openai"
+OLLAMA_URL = "http://localhost:11434/api/chat"
+OLLAMA_MODEL = "qwen2.5:3b"   # модель из команды: ollama list
+OPENAI_MODEL = "gpt-4o-mini"
+OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
+
+TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+OCR_LANG = "rus+eng"
+
+# Область чата в долях экрана: (left, top, width, height)
+# Для стандартного HUD чат в левом нижнем углу.
+CHAT_REGION_REL = (0.00, 0.50, 0.42, 0.42)
+
+OCR_THRESHOLD = 150           # порог яркости текста (подбирай 120..190)
+LINES_TO_READ = 5             # сколько последних строк чата отдавать модели
+MAX_LEN = 110                 # максимальная длина ответа (лимит чата CS2 ~ 127)
+MY_NICK = ""                  # твой ник: строки с ним бот игнорирует как "свои"
+DEBUG = True                  # сохранять debug_last.png с тем, что видит OCR
+
+PERSONA = (
+    "Ты уверенный игрок в CS2 и отвечаешь в чате от лица пользователя. "
+    "Подстраивайся под тон последнего сообщения: "
+    "если пишут дружелюбно или шутят, отвечай легко и с юмором, без мата; "
+    "если пишут по делу, отвечай по делу; "
+    "если пишут гадости, токсичат или провоцируют, не терпи и не извиняйся: "
+    "отвечай дерзко и в лоб, можно с матом, подколи его игру, тон или слив. "
+    "Мат используй к месту, не в каждом слове. "
+    "Пиши коротко, 3-10 слов, живым геймерским языком. "
+    "Запрещено: национальные, расовые и подобные оскорбления, угрозы, "
+    "оскорбления семьи и личной жизни. Бей по игре и поведению, а не по происхождению. "
+    "Не пиши, что ты ИИ, не оправдывайся и не извиняйся."
+    "\n\nПримеры:\n"
+    "Чат: 'gg wp' -> 'gg, хорошая катка'\n"
+    "Чат: 'нуб, удали игру' -> 'иди сначала на табло посмотри, ссыкло'\n"
+    "Чат: 'ты вообще играть умеешь?' -> 'умею, а ты хреново тащишь, вот и бесишься'\n"
+    "Чат: 'рак, не мешай' -> 'сам не мешай, раз в четвёртый раз сливаешь раунд'"
+)
+# =========================================================
+
+SYSTEM_PROMPT = (
+    PERSONA
+    + "\nТебе дают последние строки игрового чата (распознаны OCR, возможны опечатки). "
+    "Ответь на последнее сообщение ОДНОЙ короткой фразой до "
+    + str(MAX_LEN)
+    + " символов на том же языке, на котором пишут в чате. "
+    "НИКОГДА не копируй и не повторяй фразы из чата и свои прошлые ответы: придумай новый. "
+    "Выведи только текст ответа: без кавычек, без пояснений, без префикса 'say'."
+)
+
+MSS = getattr(mss, "MSS", None) or mss.mss  # новое имя класса в свежих версиях mss
+pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+pyautogui.PAUSE = 0.02
+_busy = threading.Lock()
+_sent = []  # последние ответы бота (чтобы не повторяться и не отвечать себе)
+
+
+# ---------------------- ЭКРАН + OCR ----------------------
+def grab_chat() -> Image.Image:
+    with MSS() as sct:
+        mon = sct.monitors[1]  # основной монитор
+        l, t, w, h = CHAT_REGION_REL
+        region = {
+            "left": mon["left"] + int(mon["width"] * l),
+            "top": mon["top"] + int(mon["height"] * t),
+            "width": int(mon["width"] * w),
+            "height": int(mon["height"] * h),
+        }
+        shot = sct.grab(region)
+        return Image.frombytes("RGB", shot.size, shot.rgb)
+
+
+def ocr_chat(img: Image.Image) -> str:
+    gray = img.convert("L")
+    gray = gray.resize((gray.width * 2, gray.height * 2), Image.LANCZOS)
+    gray = ImageOps.autocontrast(gray)
+    # светлый текст -> чёрный на белом (так Tesseract читает лучше)
+    bw = gray.point(lambda p: 0 if p > OCR_THRESHOLD else 255)
+    if DEBUG:
+        bw.save("debug_last.png")
+    return pytesseract.image_to_string(bw, lang=OCR_LANG, config="--psm 6")
+
+
+# Сообщение игрока в CS2 выглядит как "[ALL] Ник: текст" или "[T] Ник @ Место: текст".
+# Системные сообщения (вошёл/вышел, покупки, бомба, голосования) двоеточия с ником не имеют.
+CHAT_LINE_RE = re.compile(r"^(?P<nick>[^:]{1,40}?)\s*:\s*(?P<msg>\S.*)$")
+SYSTEM_NICKS = ("server", "сервер", "vote", "голосован", "console", "консоль",
+                "round", "раунд", "warning", "info")
+
+
+def player_messages(text: str, n: int):
+    """Оставляет только строки вида 'Ник: сообщение', системные отбрасывает."""
+    result = []
+    for ln in text.splitlines():
+        ln = ln.strip()
+        if len(ln) < 4:
+            continue
+        m = CHAT_LINE_RE.match(ln)
+        if not m:
+            continue
+        nick = m.group("nick").lower()
+        if len(nick.split()) > 5:          # слишком длинное для ника -> системная фраза
+            continue
+        if any(nick.startswith(x) or nick.endswith(x) for x in SYSTEM_NICKS):
+            continue
+        result.append(ln)
+    return result[-n:]
+
+
+def is_my_message(line: str) -> bool:
+    if not MY_NICK:
+        return False
+    m = CHAT_LINE_RE.match(line)
+    nick = (m.group("nick") if m else line).lower()
+    me = MY_NICK.lower()
+    return me in nick or SequenceMatcher(None, me, nick.split("]")[-1].strip()).ratio() > 0.75
+
+
+# ---------------------- LLM ----------------------
+def label_lines(lines):
+    """Заменяет ники (OCR превращает их в мусор) на номера игроков: [(1, 'текст'), ...]."""
+    nicks, out = [], []
+    for ln in lines:
+        m = CHAT_LINE_RE.match(ln)
+        if not m:
+            continue
+        nick = re.sub(r"^\[\S{1,8}\s*", "", m.group("nick")).strip().lower()
+        msg = m.group("msg").strip()
+        idx = next((i for i, n in enumerate(nicks)
+                    if SequenceMatcher(None, n, nick).ratio() > 0.6), None)
+        if idx is None:
+            nicks.append(nick)
+            idx = len(nicks) - 1
+        out.append((idx + 1, msg))
+    return out
+
+
+def similar(a: str, b: str) -> float:
+    return SequenceMatcher(None, a.lower().strip(), b.lower().strip()).ratio()
+
+
+def build_prompt(labeled) -> str:
+    chat = "\n".join(f"Игрок{n}: {msg}" for n, msg in labeled)
+    last_n, last_msg = labeled[-1]
+    prompt = (
+        f"Последние сообщения в чате:\n{chat}\n\n"
+        f"Ответь на последнее сообщение от Игрок{last_n}: \"{last_msg}\"\n"
+        "Не копируй его слова, придумай свой ответ."
+    )
+    if _sent:
+        prompt += "\nТвои прошлые ответы (НЕ повторяй их): " + " | ".join(_sent[-5:])
+    return prompt
+
+
+def ask_llm(prompt: str, temperature: float = 0.9) -> str:
+    msgs = [{"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt}]
+    if LLM_BACKEND == "ollama":
+        r = requests.post(
+            OLLAMA_URL,
+            json={"model": OLLAMA_MODEL, "messages": msgs, "stream": False,
+                  "options": {"temperature": temperature, "top_p": 0.92,
+                              "repeat_penalty": 1.25, "num_predict": 60}},
+            timeout=90,
+        )
+        r.raise_for_status()
+        return r.json()["message"]["content"]
+    if LLM_BACKEND == "openai":
+        if not OPENAI_KEY:
+            raise RuntimeError("Не задан OPENAI_API_KEY")
+        r = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_KEY}"},
+            json={"model": OPENAI_MODEL, "messages": msgs, "max_tokens": 60,
+                  "temperature": temperature, "frequency_penalty": 0.7},
+            timeout=30,
+        )
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
+    raise ValueError("LLM_BACKEND должен быть 'ollama' или 'openai'")
+
+
+def clean_answer(s: str) -> str:
+    s = s.strip().replace("\n", " ").replace('"', "").replace("«", "").replace("»", "")
+    if s.lower().startswith("say "):
+        s = s[4:]
+    return s[:MAX_LEN].strip()
+
+
+# ---------------------- ВВОД В ИГРУ ----------------------
+def read_chat_from_game():
+    pyautogui.press(CHAT_KEY)      # открыть чат -> история становится видимой
+    time.sleep(0.25)
+    img = grab_chat()
+    pyautogui.press("esc")         # закрыть чат
+    time.sleep(0.1)
+    return player_messages(ocr_chat(img), LINES_TO_READ)
+
+
+def write_to_chat(text: str):
+    pyperclip.copy(text)           # через буфер, чтобы работала кириллица
+    pyautogui.press(CHAT_KEY)
+    time.sleep(0.2)
+    pyautogui.hotkey("ctrl", "v")
+    if AUTO_SEND:
+        time.sleep(0.1)
+        pyautogui.press("enter")
+
+
+# ---------------------- ОСНОВНОЙ ЦИКЛ ----------------------
+def handle_hotkey():
+    if not _busy.acquire(blocking=False):
+        return
+    try:
+        print("\n[*] Читаю чат...")
+        lines = read_chat_from_game()
+        if not lines:
+            print("[!] Сообщений игроков не найдено (только системные или OCR не распознал).")
+            print("    Если чат виден, запусти --calibrate и подгони CHAT_REGION_REL.")
+            return
+        print("--- Распознано ---\n" + "\n".join(lines) + "\n------------------")
+        if is_my_message(lines[-1]):
+            print("[-] Последнее сообщение твоё, отвечать не на что.")
+            return
+        labeled = label_lines(lines)
+        if not labeled:
+            print("[!] Не удалось разобрать сообщения.")
+            return
+        last_msg = labeled[-1][1]
+        if any(similar(last_msg, x) > 0.8 for x in _sent):
+            print("[-] Последнее сообщение — это ответ самого бота (или твой повтор), пропускаю.")
+            return
+
+        prompt = build_prompt(labeled)
+        chat_texts = [m for _, m in labeled]
+        answer = ""
+        for attempt in range(3):
+            cand = clean_answer(ask_llm(prompt, temperature=0.9 + 0.1 * attempt))
+            if cand and not any(similar(cand, x) > 0.7 for x in chat_texts + _sent):
+                answer = cand
+                break
+            print(f"[~] Модель повторила фразу ({cand!r}), пробую ещё раз...")
+        if not answer:
+            print("[!] Модель только копировала чат. Нажми F8 ещё раз или смени модель/PERSONA.")
+            return
+
+        print(f"[AI] {answer}")
+        write_to_chat(answer)
+        _sent.append(answer)
+        del _sent[:-10]
+        print("[OK] Отправлено." if AUTO_SEND else "[OK] Текст в чате. Жми Enter, чтобы отправить.")
+    except requests.exceptions.ConnectionError:
+        print("[!] Нет связи с LLM. Если Ollama: запущена ли она? (ollama serve)")
+    except Exception as e:
+        print(f"[!] Ошибка: {e}")
+    finally:
+        _busy.release()
+
+
+def calibrate():
+    print("Переключись в CS2 и открой чат (клавиша Y). Скриншот через 5 секунд...")
+    for i in range(5, 0, -1):
+        print(i, end=" ", flush=True)
+        time.sleep(1)
+    img = grab_chat()
+    img.save("chat_area.png")
+    text = ocr_chat(img)
+    print("\n\nСохранено: chat_area.png (что видит скрипт) и debug_last.png (после обработки)")
+    print("--- Результат OCR ---")
+    print(text if text.strip() else "(пусто)")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--calibrate", action="store_true")
+    args = ap.parse_args()
+
+    if args.calibrate:
+        calibrate()
+        return
+
+    print(f"Готов. {HOTKEY.upper()} - ответить в чат, {EXIT_HOTKEY.upper()} - выход.")
+    print(f"LLM: {LLM_BACKEND} | AUTO_SEND: {AUTO_SEND}")
+    keyboard.add_hotkey(HOTKEY, lambda: threading.Thread(target=handle_hotkey, daemon=True).start())
+    keyboard.wait(EXIT_HOTKEY)
+    print("Выход.")
+
+
+if __name__ == "__main__":
+    main()
